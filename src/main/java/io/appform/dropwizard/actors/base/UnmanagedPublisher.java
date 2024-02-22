@@ -1,5 +1,8 @@
 package io.appform.dropwizard.actors.base;
 
+import static io.appform.dropwizard.actors.common.Constants.MESSAGE_EXPIRY_TEXT;
+import static io.appform.dropwizard.actors.common.Constants.MESSAGE_PUBLISHED_TEXT;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
 import com.rabbitmq.client.AMQP;
@@ -8,18 +11,18 @@ import com.rabbitmq.client.MessageProperties;
 import io.appform.dropwizard.actors.actor.ActorConfig;
 import io.appform.dropwizard.actors.actor.DelayType;
 import io.appform.dropwizard.actors.base.utils.NamingUtils;
+import io.appform.dropwizard.actors.common.RabbitmqActorException;
 import io.appform.dropwizard.actors.connectivity.RMQConnection;
-import lombok.extern.slf4j.Slf4j;
-import lombok.val;
-import org.apache.commons.lang3.RandomUtils;
+import io.appform.dropwizard.actors.observers.PublishObserverContext;
+import io.appform.dropwizard.actors.observers.RMQObserver;
 
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
-
-import static io.appform.dropwizard.actors.common.Constants.MESSAGE_EXPIRY_TEXT;
-import static io.appform.dropwizard.actors.common.Constants.MESSAGE_PUBLISHED_TEXT;
+import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import org.apache.commons.lang3.RandomUtils;
 
 @Slf4j
 public class UnmanagedPublisher<Message> {
@@ -29,7 +32,7 @@ public class UnmanagedPublisher<Message> {
     private final RMQConnection connection;
     private final ObjectMapper mapper;
     private final String queueName;
-
+    private final RMQObserver observer;
     private Channel publishChannel;
 
     public UnmanagedPublisher(
@@ -42,41 +45,54 @@ public class UnmanagedPublisher<Message> {
         this.connection = connection;
         this.mapper = mapper;
         this.queueName = NamingUtils.queueName(config.getPrefix(), name);
+        this.observer = connection.getRootObserver();
     }
 
     public final void publishWithDelay(final Message message, final long delayMilliseconds) throws Exception {
         log.info("Publishing message to exchange with delay: {}", delayMilliseconds);
+        val properties = getPropertiesWithDelay(delayMilliseconds);
+        publishWithDelay(message, properties);
+    }
+
+    private final void publishWithDelay(final Message message, final AMQP.BasicProperties properties) throws Exception {
         if (!config.isDelayed()) {
             log.warn("Publishing delayed message to non-delayed queue queue:{}", queueName);
         }
-
         if (config.getDelayType() == DelayType.TTL) {
-            publishChannel.basicPublish(ttlExchange(config),
-                    queueName,
-                    new AMQP.BasicProperties.Builder()
-                            .expiration(String.valueOf(delayMilliseconds))
-                            .deliveryMode(2)
-                            .build(),
-                    mapper().writeValueAsBytes(message));
+            val routingKey = getRoutingKey();
+            val context = PublishObserverContext.builder()
+                    .queueName(queueName)
+                    .build();
+            observer.executePublish(context, () -> {
+                try {
+                    publishChannel.basicPublish(ttlExchange(config),
+                            routingKey, properties,
+                            mapper().writeValueAsBytes(message));
+                } catch (IOException e) {
+                    log.error("Error while publishing: {}", e);
+                    throw RabbitmqActorException.propagate(e);
+                }
+                return null;
+            });
         } else {
-            publish(message, new AMQP.BasicProperties.Builder()
-                    .headers(Collections.singletonMap("x-delay", delayMilliseconds))
-                    .deliveryMode(2)
-                    .build());
+            publish(message, properties);
         }
     }
-
     public final void publishWithExpiry(final Message message, final long expiryInMs) throws Exception {
         AMQP.BasicProperties properties = new AMQP.BasicProperties.Builder()
                 .deliveryMode(2)
                 .build();
-        if (expiryInMs > 0) {
-            val expiresAt = Instant.now().toEpochMilli() + expiryInMs;
-            properties = properties.builder()
-                    .headers(ImmutableMap.of(MESSAGE_EXPIRY_TEXT, expiresAt))
-                    .build();
-        }
-        publish(message, properties);
+        val finalProperties = getPropertiesWithExpiry(properties, expiryInMs);
+        publish(message, finalProperties);
+    }
+
+    public final void publishWithDelayAndExpiry(final Message message,
+                                                final long expiryInMs,
+                                                final long delayMilliseconds) throws Exception {
+        AMQP.BasicProperties properties = getPropertiesWithDelay(delayMilliseconds);
+        val finalProperties = getPropertiesWithExpiry(properties, expiryInMs);
+        publishWithDelay(message, finalProperties);
+
     }
 
     public final void publish(final Message message) throws Exception {
@@ -84,14 +100,20 @@ public class UnmanagedPublisher<Message> {
     }
 
     public final void publish(final Message message, final AMQP.BasicProperties properties) throws Exception {
-        String routingKey;
-        if (config.isSharded()) {
-            routingKey = NamingUtils.getShardedQueueName(queueName, getShardId());
-        } else {
-            routingKey = queueName;
-        }
-        val enrichedProperties = getEnrichedProperties(properties);
-        publishChannel.basicPublish(config.getExchange(), routingKey, enrichedProperties, mapper().writeValueAsBytes(message));
+        val routingKey = getRoutingKey();
+        val context = PublishObserverContext.builder()
+                .queueName(queueName)
+                .build();
+        observer.executePublish(context, () -> {
+            val enrichedProperties = getEnrichedProperties(properties);
+            try {
+                publishChannel.basicPublish(config.getExchange(), routingKey, enrichedProperties, mapper().writeValueAsBytes(message));
+            } catch (IOException e) {
+                log.error("Error while publishing: {}", e);
+                throw RabbitmqActorException.propagate(e);
+            }
+            return null;
+        });
     }
 
     private AMQP.BasicProperties getEnrichedProperties(AMQP.BasicProperties properties) {
@@ -107,6 +129,29 @@ public class UnmanagedPublisher<Message> {
 
     private int getShardId() {
         return RandomUtils.nextInt(0, config.getShardCount());
+    }
+
+    private AMQP.BasicProperties getPropertiesWithDelay(final long delayMilliseconds){
+        if(config.getDelayType() == DelayType.TTL){
+            return new AMQP.BasicProperties.Builder()
+                    .expiration(String.valueOf(delayMilliseconds))
+                    .deliveryMode(2)
+                    .build();
+        }
+            return new AMQP.BasicProperties.Builder()
+                    .headers(Collections.singletonMap("x-delay", delayMilliseconds))
+                    .deliveryMode(2)
+                    .build();
+    }
+
+    private AMQP.BasicProperties getPropertiesWithExpiry(final AMQP.BasicProperties properties, final long expiryInMs){
+        if (expiryInMs <= 0) {
+            return properties;
+        }
+        val expiresAt = Instant.now().toEpochMilli() + expiryInMs;
+        return new AMQP.BasicProperties.Builder()
+                .headers(ImmutableMap.of(MESSAGE_EXPIRY_TEXT, expiresAt))
+                .build();
     }
 
     public final long pendingMessagesCount() {
@@ -172,13 +217,7 @@ public class UnmanagedPublisher<Message> {
     private void ensureExchange(String exchange) throws IOException {
         connection.channel().exchangeDeclare(
                 exchange,
-                "direct",
-                true,
-                false,
-                ImmutableMap.<String, Object>builder()
-                        .put("x-ha-policy", "all")
-                        .put("ha-mode", "all")
-                        .build());
+                "direct", true);
         log.info("Created exchange: {}", exchange);
     }
 
@@ -186,14 +225,13 @@ public class UnmanagedPublisher<Message> {
         if (config.getDelayType() == DelayType.TTL) {
             ensureExchange(ttlExchange(config));
         } else {
+            // https://blog.rabbitmq.com/posts/2015/04/scheduling-messages-with-rabbitmq/
             connection.channel().exchangeDeclare(
                     exchange,
                     "x-delayed-message",
                     true,
                     false,
                     ImmutableMap.<String, Object>builder()
-                            .put("x-ha-policy", "all")
-                            .put("ha-mode", "all")
                             .put("x-delayed-type", "direct")
                             .build());
             log.info("Created delayed exchange: {}", exchange);
@@ -228,5 +266,9 @@ public class UnmanagedPublisher<Message> {
 
     protected final ObjectMapper mapper() {
         return mapper;
+    }
+
+    private String getRoutingKey() {
+        return config.isSharded() ? NamingUtils.getShardedQueueName(queueName, getShardId()) : queueName;
     }
 }

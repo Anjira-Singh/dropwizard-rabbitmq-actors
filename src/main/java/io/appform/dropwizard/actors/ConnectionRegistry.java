@@ -1,10 +1,13 @@
 package io.appform.dropwizard.actors;
 
+import com.google.common.base.Joiner;
 import io.appform.dropwizard.actors.common.Constants;
+import io.appform.dropwizard.actors.common.ErrorCode;
 import io.appform.dropwizard.actors.common.RabbitmqActorException;
 import io.appform.dropwizard.actors.config.RMQConfig;
 import io.appform.dropwizard.actors.connectivity.ConnectionConfig;
 import io.appform.dropwizard.actors.connectivity.RMQConnection;
+import io.appform.dropwizard.actors.observers.RMQObserver;
 import io.dropwizard.lifecycle.Managed;
 import io.dropwizard.setup.Environment;
 import lombok.Data;
@@ -25,16 +28,19 @@ public class ConnectionRegistry implements Managed {
     private final ExecutorServiceProvider executorServiceProvider;
     private final RMQConfig rmqConfig;
     private TtlConfig ttlConfig;
+    private RMQObserver rootObserver;
 
     public ConnectionRegistry(final Environment environment,
                               final ExecutorServiceProvider executorServiceProvider,
                               final RMQConfig rmqConfig,
-                              final TtlConfig ttlConfig) {
+                              final TtlConfig ttlConfig,
+                              final RMQObserver rootObserver) {
         this.environment = environment;
         this.executorServiceProvider = executorServiceProvider;
         this.rmqConfig = rmqConfig;
         this.ttlConfig = ttlConfig;
         this.connections = new ConcurrentHashMap<>();
+        this.rootObserver = rootObserver;
     }
 
     public RMQConnection createOrGet(String connectionName) {
@@ -43,6 +49,7 @@ public class ConnectionRegistry implements Managed {
     }
 
     public RMQConnection createOrGet(String connectionName, int threadPoolSize) {
+
         return connections.computeIfAbsent(connectionName, connection -> {
             log.info(String.format("Creating new RMQ connection with name [%s] having [%d] threads", connection,
                     threadPoolSize));
@@ -51,7 +58,7 @@ public class ConnectionRegistry implements Managed {
                     rmqConfig,
                     executorServiceProvider.newFixedThreadPool(String.format("rmqconnection-%s", connection),
                             threadPoolSize),
-                    environment, ttlConfig);
+                    environment, ttlConfig, rootObserver);
             try {
                 rmqConnection.start();
             } catch (Exception e) {
@@ -63,7 +70,7 @@ public class ConnectionRegistry implements Managed {
     }
 
     private int determineThreadPoolSize(String connectionName) {
-        if (Objects.equals(connectionName, Constants.DEFAULT_CONNECTION_NAME)) {
+        if (Constants.DEFAULT_CONNECTIONS.contains(connectionName)) {
             return rmqConfig.getThreadPoolSize();
         }
 
